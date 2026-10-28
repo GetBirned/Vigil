@@ -1,0 +1,13 @@
+find_package(GTest REQUIRED)
+include(GoogleTest)
+
+add_executable(vigil_tests
+  test_messages.cpp
+  test_udp.cpp
+  test_scenario.cpp
+  test_kalman.cpp
+  test_track_manager.cpp)
+target_link_libraries(vigil_tests PRIVATE vigil::common vigil::sim vigil::tracker GTest::gtest_main
+                                        vigil_options)
+
+gtest_discover_tests(vigil_tests)
