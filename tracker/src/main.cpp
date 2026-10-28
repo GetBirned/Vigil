@@ -1,4 +1,5 @@
-// vigil-tracker: receives detection reports over UDP and maintains a track picture.
+// vigil-tracker: receives detection reports over UDP, maintains a track picture, and
+// publishes each scan's detections and tracks to a display feed.
 
 #include <algorithm>
 #include <array>
@@ -14,8 +15,10 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "vigil/messages.hpp"
+#include "vigil/tracker/publish.hpp"
 #include "vigil/tracker/track_manager.hpp"
 #include "vigil/udp.hpp"
 
@@ -28,8 +31,21 @@ void on_signal(int /*signum*/) { g_stop = 1; }
 struct Options {
   std::string bind_address = "0.0.0.0";
   std::uint16_t port = 50'000;
+  std::string display_host = "127.0.0.1";
+  std::uint16_t display_port = 50'001;
+  bool display = true;
   bool quiet = false;
 };
+
+void print_usage() {
+  std::cout << "Usage: vigil-tracker [options]\n"
+               "  --bind ADDR          address to receive detections on (default 0.0.0.0)\n"
+               "  --port N             UDP port to receive detections on (default 50000)\n"
+               "  --display-host ADDR  where to publish the display feed (default 127.0.0.1)\n"
+               "  --display-port N     display feed UDP port (default 50001)\n"
+               "  --no-display         don't publish a display feed\n"
+               "  --quiet              don't print the track table each scan\n";
+}
 
 Options parse_args(int argc, char** argv) {
   Options opt;
@@ -47,10 +63,16 @@ Options parse_args(int argc, char** argv) {
       opt.bind_address = value();
     } else if (arg == "--port") {
       opt.port = static_cast<std::uint16_t>(std::stoul(value()));
+    } else if (arg == "--display-host") {
+      opt.display_host = value();
+    } else if (arg == "--display-port") {
+      opt.display_port = static_cast<std::uint16_t>(std::stoul(value()));
+    } else if (arg == "--no-display") {
+      opt.display = false;
     } else if (arg == "--quiet") {
       opt.quiet = true;
     } else if (arg == "--help" || arg == "-h") {
-      std::cout << "Usage: vigil-tracker [--bind ADDR] [--port N] [--quiet]\n";
+      print_usage();
       std::exit(0);
     } else {
       std::cerr << "unknown option " << arg << '\n';
@@ -97,6 +119,21 @@ int main(int argc, char** argv) {
   socket.bind(opt.bind_address, opt.port);
   std::cout << "vigil-tracker: listening on " << opt.bind_address << ':' << socket.local_port()
             << " (Ctrl-C to stop)\n";
+  if (opt.display) {
+    std::cout << "vigil-tracker: display feed -> " << opt.display_host << ':' << opt.display_port
+              << '\n';
+  }
+
+  vigil::UdpSocket display_socket;
+  std::uint64_t display_errors = 0;
+  // The display is optional: a send failure is counted, never fatal.
+  auto publish = [&](std::span<const std::byte> datagram) {
+    try {
+      display_socket.send_to(opt.display_host, opt.display_port, datagram);
+    } catch (const std::system_error&) {
+      ++display_errors;
+    }
+  };
 
   vigil::tracker::TrackManager tracker;
   std::array<std::byte, 65'536> buffer{};
@@ -150,6 +187,13 @@ int main(int argc, char** argv) {
     total_us += us;
     max_us = std::max(max_us, us);
 
+    if (opt.display) {
+      // Raw detections first, then the picture they produced, so a display can draw both.
+      publish(std::span(buffer).first(*size));
+      publish(vigil::encode(vigil::tracker::make_track_report(
+          tracker, *report, static_cast<std::uint32_t>(std::lround(us * 1000.0)))));
+    }
+
     if (!opt.quiet) {
       print_picture(*report, tracker, us);
     }
@@ -157,7 +201,7 @@ int main(int argc, char** argv) {
 
   std::cout << "\nvigil-tracker: " << reports << " reports processed, " << dropped
             << " lost in transit, " << out_of_order << " out of order, " << decode_errors
-            << " malformed\n";
+            << " malformed, " << display_errors << " display send errors\n";
   if (reports > 0) {
     std::printf("processing latency: mean %.1f us, max %.1f us\n",
                 total_us / static_cast<double>(reports), max_us);

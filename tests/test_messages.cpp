@@ -118,5 +118,80 @@ TEST(Messages, RejectsNonFiniteCoordinates) {
   EXPECT_EQ(decode(encode(r)).error(), DecodeError::kNonFiniteValue);
 }
 
+TrackReport sample_track_report() {
+  TrackReport r;
+  r.seq = 99;
+  r.source_id = 2;
+  r.timestamp_ns = 42'000'000'000ULL;
+  r.processing_ns = 12'345;
+  r.detections_in_scan = 9;
+  r.tracks = {
+      {.id = 1, .status = WireTrackStatus::kConfirmed, .hits = 17, .x_m = 9569.5, .y_m = -8602.25,
+       .vx_mps = -45.0, .vy_mps = -85.5, .position_sigma_m = 14.5F, .velocity_sigma_mps = 6.25F},
+      {.id = 6, .status = WireTrackStatus::kCoasting, .hits = 4, .x_m = 0.0, .y_m = 1.0,
+       .vx_mps = 2.0, .vy_mps = 3.0, .position_sigma_m = 80.0F, .velocity_sigma_mps = 30.0F},
+  };
+  return r;
+}
+
+TEST(TrackReports, RoundTripPreservesEveryField) {
+  const TrackReport in = sample_track_report();
+  const auto bytes = encode(in);
+  ASSERT_EQ(bytes.size(), wire::kHeaderSize + wire::kTrackSummarySize + 2 * wire::kTrackSize);
+  EXPECT_EQ(bytes[6], std::byte{0x02});  // message type
+
+  const auto out = decode_track_report(bytes);
+  ASSERT_TRUE(out.has_value()) << to_string(out.error());
+  EXPECT_EQ(out->seq, in.seq);
+  EXPECT_EQ(out->source_id, in.source_id);
+  EXPECT_EQ(out->timestamp_ns, in.timestamp_ns);
+  EXPECT_EQ(out->processing_ns, in.processing_ns);
+  EXPECT_EQ(out->detections_in_scan, in.detections_in_scan);
+  ASSERT_EQ(out->tracks.size(), 2U);
+  for (std::size_t i = 0; i < 2; ++i) {
+    EXPECT_EQ(out->tracks[i].id, in.tracks[i].id);
+    EXPECT_EQ(out->tracks[i].status, in.tracks[i].status);
+    EXPECT_EQ(out->tracks[i].hits, in.tracks[i].hits);
+    EXPECT_EQ(out->tracks[i].x_m, in.tracks[i].x_m);
+    EXPECT_EQ(out->tracks[i].y_m, in.tracks[i].y_m);
+    EXPECT_EQ(out->tracks[i].vx_mps, in.tracks[i].vx_mps);
+    EXPECT_EQ(out->tracks[i].vy_mps, in.tracks[i].vy_mps);
+    EXPECT_EQ(out->tracks[i].position_sigma_m, in.tracks[i].position_sigma_m);
+    EXPECT_EQ(out->tracks[i].velocity_sigma_mps, in.tracks[i].velocity_sigma_mps);
+  }
+}
+
+TEST(TrackReports, MessageTypesAreNotInterchangeable) {
+  EXPECT_EQ(decode(encode(sample_track_report())).error(), DecodeError::kUnknownMessageType);
+  EXPECT_EQ(decode_track_report(encode(sample_report())).error(),
+            DecodeError::kUnknownMessageType);
+}
+
+TEST(TrackReports, RejectsTruncatedBody) {
+  auto bytes = encode(sample_track_report());
+  bytes.pop_back();
+  EXPECT_EQ(decode_track_report(bytes).error(), DecodeError::kLengthMismatch);
+}
+
+TEST(TrackReports, RejectsUndefinedStatus) {
+  auto bytes = encode(sample_track_report());
+  bytes[wire::kHeaderSize + wire::kTrackSummarySize + 4] = std::byte{0x07};
+  EXPECT_EQ(decode_track_report(bytes).error(), DecodeError::kBadTrackStatus);
+}
+
+TEST(TrackReports, RejectsNonFiniteState) {
+  TrackReport r = sample_track_report();
+  r.tracks[1].vx_mps = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(decode_track_report(encode(r)).error(), DecodeError::kNonFiniteValue);
+}
+
+TEST(TrackReports, EnforcesTrackLimit) {
+  TrackReport r;
+  r.tracks.resize(wire::kMaxTracks);
+  EXPECT_LE(encode(r).size(), wire::kMaxTrackDatagramSize);
+  r.tracks.emplace_back();
+  EXPECT_THROW((void)encode(r), std::length_error);
+}
+
 }  // namespace
 }  // namespace vigil
