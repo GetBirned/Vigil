@@ -29,3 +29,30 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  display:
+    runs-on: ubuntu-24.04
+    name: display
+    defaults:
+      run:
+        working-directory: display
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: display/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npx vite build

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254">
+  <rect width="1254" height="1254" rx="260" fill="#071117"/>
+  <g transform="translate(627 627) scale(0.74) translate(-620 -624)">
+    <mask id="cut"><rect width="1254" height="1254" fill="#fff"/><path d="M0 923.6 626.5 349.6 1254 924.9v236.4L626.2 642 0 1160.2z" fill="#000"/></mask><path d="M516.8 1126.1V231.1a110.2 110.2 0 0 1 220.4 0v895z" fill="#3ee6c4" mask="url(#cut)"/><path d="M114.7 833 630 409.6 1126.4 833H908.7L629.3 594 336.3 833z" fill="#3ee6c4"/>
+  </g>
+</svg>
