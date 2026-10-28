@@ -64,6 +64,20 @@ Innovation ConstantVelocityKf::innovation(const Vec2& measurement) const {
   return inn;
 }
 
+Mat2 ConstantVelocityKf::innovation_covariance() const {
+  // H just selects position, so H P H' is P's top-left 2x2 block.
+  return P_.topLeftCorner<2, 2>() + R_;
+}
+
+MeasurementPrediction ConstantVelocityKf::predict_measurement() const {
+  const Mat2 S = innovation_covariance();
+  return {
+      .z = x_.head<2>(),
+      .inv_covariance = S.inverse(),  // closed form for 2x2; S is SPD, well conditioned
+      .log_det_covariance = std::log(S.determinant()),
+  };
+}
+
 void ConstantVelocityKf::update(const Vec2& measurement) {
   const Mat24 H = measurement_matrix();
   const Vec2 y = measurement - H * x_;

@@ -30,6 +30,20 @@ struct Innovation {
   double log_det_covariance = 0.0;
 };
 
+// Everything needed to score measurements against one prediction. Computing it once per
+// track per scan, instead of once per (track, measurement) pair, is what makes gating cheap.
+struct MeasurementPrediction {
+  Vec2 z;                       // predicted measurement, H x
+  Mat2 inv_covariance;          // S^-1
+  double log_det_covariance = 0.0;
+
+  // Squared Mahalanobis distance of a measurement from the prediction.
+  [[nodiscard]] double mahalanobis_sq(const Vec2& measurement) const {
+    const Vec2 r = measurement - z;
+    return r.dot(inv_covariance * r);
+  }
+};
+
 class ConstantVelocityKf {
  public:
   // Starts a filter at a measured position with zero velocity and wide velocity variance.
@@ -40,6 +54,12 @@ class ConstantVelocityKf {
 
   // How well a measurement fits the current prediction. Does not modify the filter.
   [[nodiscard]] Innovation innovation(const Vec2& measurement) const;
+
+  // The current prediction in measurement space, for scoring many measurements.
+  [[nodiscard]] MeasurementPrediction predict_measurement() const;
+
+  // Innovation covariance S = H P H' + R.
+  [[nodiscard]] Mat2 innovation_covariance() const;
 
   // Folds a measurement into the estimate (Joseph form, stays symmetric and PSD).
   void update(const Vec2& measurement);

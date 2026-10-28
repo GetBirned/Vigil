@@ -7,7 +7,8 @@ add_executable(vigil_tests
   test_scenario.cpp
   test_kalman.cpp
   test_track_manager.cpp
-  test_publish.cpp)
+  test_publish.cpp
+  test_spatial_grid.cpp)
 target_link_libraries(vigil_tests PRIVATE vigil::common vigil::sim vigil::tracker GTest::gtest_main
                                         vigil_options)
 

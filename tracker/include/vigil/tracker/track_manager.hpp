@@ -10,6 +10,7 @@
 
 #include "vigil/messages.hpp"
 #include "vigil/tracker/kalman.hpp"
+#include "vigil/tracker/spatial_grid.hpp"
 
 namespace vigil::tracker {
 
@@ -36,6 +37,9 @@ struct TrackerConfig {
   int confirm_hits = 3;          // tentative -> confirmed after this many hits
   int tentative_max_misses = 2;  // drop a tentative track after this many misses in a row
   int confirmed_max_misses = 5;  // drop a coasting track after this many misses in a row
+  // Find gate candidates through a spatial grid instead of testing every
+  // (track, detection) pair. Results are identical either way; only the cost differs.
+  bool spatial_index = true;
 };
 
 struct ScanStats {
@@ -56,10 +60,20 @@ class TrackManager {
   [[nodiscard]] std::size_t count(TrackStatus status) const;
 
  private:
+  struct Candidate {
+    double cost;
+    std::size_t track;
+    std::size_t detection;
+  };
+
+  // Every (track, detection) pair inside the gate, in no particular order.
+  std::vector<Candidate> gate(std::span<const Detection> detections);
+
   TrackerConfig config_;
   std::vector<Track> tracks_;
   std::optional<double> last_time_s_;
   std::uint32_t next_id_ = 1;
+  DetectionGrid grid_;  // rebuilt every scan; kept as a member to reuse its storage
 };
 
 }  // namespace vigil::tracker

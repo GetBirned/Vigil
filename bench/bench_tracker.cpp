@@ -29,9 +29,13 @@ void BM_KalmanPredictUpdate(benchmark::State& state) {
 BENCHMARK(BM_KalmanPredictUpdate);
 
 // One predict / gate / associate / update cycle with N real targets plus clutter, in
-// steady state (tracks already confirmed).
+// steady state (tracks already confirmed). Second argument: 1 = spatial-grid gating,
+// 0 = test every (track, detection) pair.
 void BM_TrackerScan(benchmark::State& state) {
   const auto num_targets = static_cast<std::size_t>(state.range(0));
+  vigil::tracker::TrackerConfig config;
+  config.spatial_index = state.range(1) != 0;
+  state.SetLabel(config.spatial_index ? "grid" : "brute force");
   vigil::sim::SensorConfig sensor;
   sensor.clutter_per_scan = 0.05 * static_cast<double>(num_targets);
   sensor.region_half_width_m = 200'000;  // keep target density realistic as N grows
@@ -46,7 +50,7 @@ void BM_TrackerScan(benchmark::State& state) {
   }
 
   auto warm_tracker = [&] {
-    TrackManager tm;
+    TrackManager tm(config);
     for (int i = 0; i < kWarmup; ++i) {
       tm.process(scans[static_cast<std::size_t>(i)].time_s,
                  scans[static_cast<std::size_t>(i)].detections);
@@ -70,6 +74,10 @@ void BM_TrackerScan(benchmark::State& state) {
   state.SetItemsProcessed(state.iterations() * state.range(0));
   state.counters["targets"] = static_cast<double>(num_targets);
 }
-BENCHMARK(BM_TrackerScan)->RangeMultiplier(4)->Range(4, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TrackerScan)
+    ->ArgNames({"targets", "grid"})
+    ->ArgsProduct({{4, 16, 64, 256, 1024}, {0, 1}})
+    ->Args({4096, 1})  // brute force would take seconds per scan here
+    ->Unit(benchmark::kMicrosecond);
 
 }  // namespace

@@ -40,8 +40,9 @@ flowchart LR
   The receiver rejects every malformed datagram case and counts lost and out-of-order reports.
 - **Kalman filter**: constant-velocity model with discrete white-noise acceleration and a
   Joseph-form update. It uses Cholesky solves instead of explicit inverses.
-- **Data association**: chi-square gating (99%, 2 DoF), then global-nearest-neighbour
-  assignment on the normalised distance `d² + ln|S|`.
+- **Data association**: chi-square gating (99%, 2 DoF) through a spatial grid, then
+  global-nearest-neighbour assignment on the normalised distance `d² + ln|S|`. A scan with
+  1,024 targets takes under half a millisecond.
 - **Track lifecycle**: M-of-N confirmation, coasting through missed detections, and deletion.
 - **Radar-scope display**: a north-up PPI scope drawn on canvas.
   - Detections glow like phosphor as the sweep passes.
@@ -56,7 +57,7 @@ flowchart LR
   - **Show all** (or F) glides out to frame every track. Selecting an off-screen track glides
     the view to it. R recentres on the sensor, and Esc clears the selection.
   - The layout adapts to phones, and it respects reduced-motion settings.
-- **Engineering**: CMake presets, GoogleTest (39 tests), Vitest, Google Benchmark,
+- **Engineering**: CMake presets, GoogleTest (44 tests), Vitest, Google Benchmark,
   AddressSanitizer, UBSan, ThreadSanitizer, clang-tidy and GitHub Actions CI.
 
 ## Quick start
@@ -121,19 +122,33 @@ the sweep.
 
 ## Performance
 
-Measured with `./build/release/bench/vigil_bench` on a Ryzen 9 3900X under WSL2, single-threaded:
+Full tracker cycle (predict, gate, associate, update, manage) with N targets plus clutter,
+measured with `./build/release/bench/vigil_bench` on a Ryzen 9 3900X under WSL2,
+single-threaded, median of 3 runs:
 
-| Benchmark | Time per scan |
-|---|---:|
-| Kalman predict + update (one track) | 0.2 µs |
-| Full tracker cycle, 4 targets | 2 µs |
-| Full tracker cycle, 64 targets | 0.32 ms |
-| Full tracker cycle, 256 targets | 7.3 ms |
-| Full tracker cycle, 1024 targets | 141 ms |
+| Targets | Original | Per-track gate data | + Spatial grid | Speed-up |
+|---:|---:|---:|---:|---:|
+| 64 | 316 µs | 26 µs | **22 µs** | 14× |
+| 256 | 7.5 ms | 209 µs | **106 µs** | 71× |
+| 1,024 | 141 ms | 2.5 ms | **0.47 ms** | 300× |
+| 4,096 | — | — | **2.1 ms** | |
 
-Up to about 256 targets the tracker easily meets a 1 Hz scan budget. Gating currently checks
-every track against every detection, which is O(N·M), so cost grows quadratically. That is the
-first optimisation on the roadmap.
+Gating got faster in two steps:
+
+1. **Per-track gate data.** The original code rebuilt the innovation covariance, its Cholesky
+   factor and its log-determinant for every (track, detection) pair. Computing them once per
+   track per scan cut the per-pair cost from about 140 ns to about 2 ns. Gating was still
+   O(N·M), just with a much smaller constant.
+2. **Spatial grid.** Each scan's detections are bucketed into a uniform grid, with cells sized
+   to the median gate. Each track probes only the cells its gate's bounding box touches.
+   That box (half-widths √(γ·Sₓₓ) and √(γ·Sᵧᵧ)) provably contains the whole chi-square
+   ellipse, so no candidate can be missed. Very wide gates, such as a brand-new track's,
+   fall back to checking every detection. Cost now grows roughly linearly: 4× the targets
+   takes about 4.4× the time.
+
+The grid is an optimisation only. Tests run the tracker with and without it over a long
+scenario and check the track pictures are bit-for-bit identical. Set
+`TrackerConfig::spatial_index = false` to compare.
 
 ## Testing
 
@@ -157,9 +172,11 @@ TypeScript sides are both checked against the same document.
 ## Roadmap
 
 - [x] **M1**: simulator, ICD, Kalman filter, gating and GNN association, track lifecycle, tests and CI
-- [ ] **M2**: optimal assignment (Hungarian / auction), spatial-grid gating to break O(N²),
-      multithreaded receive → process pipeline with a lock-free queue, and a latency
-      histogram for each stage
+- [ ] **M2**: performance and concurrency
+  - [x] spatial-grid gating: 1,024 targets from 141 ms to 0.47 ms per scan
+  - [ ] optimal assignment (Hungarian / auction)
+  - [ ] multithreaded receive → process pipeline with a lock-free queue, and a latency
+        histogram for each stage
 - [x] **M3**: React radar-scope display over WebSocket
 - [ ] **M3.1**: truth overlay and OSPA accuracy scoring against it
 - [ ] **M4**: authenticated datagrams (HMAC + replay window), a hardened systemd service, and a
