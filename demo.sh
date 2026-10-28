@@ -93,7 +93,10 @@ trap cleanup INT TERM EXIT
 start() {
   local name=$1
   shift
-  setsid "$@" >"$LOGS/$name.log" 2>&1 &
+  # stdin from /dev/null: services must not touch the terminal. Vite puts its stdin into
+  # raw mode for its keyboard shortcuts, which turns Ctrl-C into a plain keypress and
+  # stops it from reaching this script.
+  setsid "$@" </dev/null >"$LOGS/$name.log" 2>&1 &
   pids+=($!)
 }
 
