@@ -1,8 +1,18 @@
 // vigil-tracker: receives detection reports over UDP, maintains a track picture, and
 // publishes each scan's detections and tracks to a display feed.
+//
+// Two threads, joined by a lock-free single-producer / single-consumer queue:
+//   vigil-rx     reads datagrams off the socket, stamps their arrival time and queues them.
+//                It does nothing else, so the socket is drained promptly even while the
+//                tracker is busy or the terminal is slow to print.
+//   vigil-track  (the main thread) decodes, tracks, publishes and prints, and keeps a
+//                latency histogram for each of those stages.
+
+#include <pthread.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -10,23 +20,58 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "vigil/latency_histogram.hpp"
 #include "vigil/messages.hpp"
+#include "vigil/spsc_queue.hpp"
 #include "vigil/tracker/publish.hpp"
 #include "vigil/tracker/track_manager.hpp"
 #include "vigil/udp.hpp"
 
 namespace {
 
-volatile std::sig_atomic_t g_stop = 0;
+using Clock = std::chrono::steady_clock;
 
-void on_signal(int /*signum*/) { g_stop = 1; }
+// Set from the signal handler and read by both threads, so it must be atomic, and lock-free
+// so that touching it from a signal handler is safe.
+std::atomic<bool> g_stop{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
+
+void on_signal(int /*signum*/) { g_stop.store(true, std::memory_order_relaxed); }
+
+// Reports that can wait for the tracker. At one report per scan that is minutes of backlog;
+// it only fills if the tracker falls badly behind.
+constexpr std::size_t kQueueDepth = 256;
+
+// One datagram as it came off the socket, stamped on arrival so queueing delay is measured.
+struct Datagram {
+  std::vector<std::byte> bytes;
+  Clock::time_point received;
+  bool end_of_stream = false;  // queued once, last, when the receive thread stops
+};
+
+struct ReceiveStats {
+  std::uint64_t datagrams = 0;
+  std::uint64_t queue_full = 0;  // dropped because the tracker had fallen behind
+};
+
+// Shows up in top -H, perf and gdb's thread list.
+void name_this_thread(const char* name) { pthread_setname_np(pthread_self(), name); }
+
+std::uint64_t ns_between(Clock::time_point from, Clock::time_point to) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
 
 struct Options {
   std::string bind_address = "0.0.0.0";
@@ -35,6 +80,7 @@ struct Options {
   std::uint16_t display_port = 50'001;
   bool display = true;
   bool quiet = false;
+  bool spin = false;
 };
 
 void print_usage() {
@@ -44,7 +90,9 @@ void print_usage() {
                "  --display-host ADDR  where to publish the display feed (default 127.0.0.1)\n"
                "  --display-port N     display feed UDP port (default 50001)\n"
                "  --no-display         don't publish a display feed\n"
-               "  --quiet              don't print the track table each scan\n";
+               "  --quiet              don't print the track table each scan\n"
+               "  --spin               busy-poll the receive queue instead of sleeping:\n"
+               "                       lower latency, but keeps one core at 100%\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -71,6 +119,8 @@ Options parse_args(int argc, char** argv) {
       opt.display = false;
     } else if (arg == "--quiet") {
       opt.quiet = true;
+    } else if (arg == "--spin") {
+      opt.spin = true;
     } else if (arg == "--help" || arg == "-h") {
       print_usage();
       std::exit(0);
@@ -108,6 +158,60 @@ void print_picture(const vigil::DetectionReport& report, const vigil::tracker::T
   }
 }
 
+// The vigil-rx thread. Never blocks on the tracker: if the queue is full, the newest datagram
+// is dropped and counted. Stalling here instead would only move the loss into the kernel's
+// socket buffer, where nobody can see it.
+ReceiveStats receive_loop(const std::stop_token& stop, vigil::UdpSocket& socket,
+                          vigil::SpscQueue<Datagram>& queue) {
+  name_this_thread("vigil-rx");
+  ReceiveStats stats;
+  std::array<std::byte, 65'536> buffer{};
+  while (!stop.stop_requested() && !g_stop.load(std::memory_order_relaxed)) {
+    const auto size = socket.receive(buffer, std::chrono::milliseconds(200));
+    if (!size) {
+      continue;
+    }
+    Datagram datagram{.bytes = {buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*size)},
+                      .received = Clock::now()};
+    ++stats.datagrams;
+    if (!queue.try_push(std::move(datagram))) {
+      ++stats.queue_full;
+    }
+  }
+  // Tell the tracker nothing more is coming. It is draining the queue, so this only waits
+  // while the queue is full, and gives up if the tracker itself is shutting down.
+  Datagram end{.bytes = {}, .received = Clock::now(), .end_of_stream = true};
+  while (!queue.try_push(std::move(end)) && !stop.stop_requested()) {
+    std::this_thread::yield();
+  }
+  return stats;
+}
+
+struct StageLatency {
+  vigil::LatencyHistogram queue;    // arrival on the socket -> picked up by the tracker
+  vigil::LatencyHistogram decode;   // datagram -> DetectionReport
+  vigil::LatencyHistogram track;    // predict, gate, associate, update, manage
+  vigil::LatencyHistogram publish;  // encode and send to the display
+  vigil::LatencyHistogram total;    // arrival on the socket -> track picture sent
+};
+
+void print_latency(const StageLatency& latency) {
+  if (latency.total.count() == 0) {
+    return;
+  }
+  std::printf("\nlatency per report (us)       p50       p90       p99     p99.9       max\n");
+  const auto row = [](const char* name, const vigil::LatencyHistogram& h) {
+    const auto us = [](std::uint64_t ns) { return static_cast<double>(ns) * 1e-3; };
+    std::printf("  %-22s %9.1f %9.1f %9.1f %9.1f %9.1f\n", name, us(h.quantile(0.5)),
+                us(h.quantile(0.9)), us(h.quantile(0.99)), us(h.quantile(0.999)), us(h.max()));
+  };
+  row("queue wait", latency.queue);
+  row("decode", latency.decode);
+  row("track", latency.track);
+  row("publish", latency.publish);
+  row("socket to display", latency.total);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -135,29 +239,48 @@ int main(int argc, char** argv) {
     }
   };
 
+  vigil::SpscQueue<Datagram> queue(kQueueDepth);
+  ReceiveStats rx_stats;
+  // Asked to stop and joined when it goes out of scope, including if the tracker throws.
+  std::jthread receiver(
+      [&](const std::stop_token& stop) { rx_stats = receive_loop(stop, socket, queue); });
+  name_this_thread("vigil-track");
+
   vigil::tracker::TrackManager tracker;
-  std::array<std::byte, 65'536> buffer{};
+  StageLatency latency;
 
   std::uint64_t reports = 0;
   std::uint64_t decode_errors = 0;
-  std::uint64_t dropped = 0;
+  std::uint64_t missing = 0;
   std::uint64_t out_of_order = 0;
+  std::size_t max_queue_depth = 0;
   std::optional<std::uint32_t> last_seq;
-  double total_us = 0.0;
-  double max_us = 0.0;
 
-  while (g_stop == 0) {
-    const auto size = socket.receive(buffer, std::chrono::milliseconds(200));
-    if (!size) {
+  for (;;) {
+    auto datagram = queue.try_pop();
+    if (!datagram) {
+      // Sleeping costs a kernel wake-up (tens of microseconds) per report; spinning trades a
+      // core for not paying it.
+      if (!opt.spin) {
+        queue.wait();
+      }
       continue;
     }
+    if (datagram->end_of_stream) {
+      break;
+    }
+    const auto dequeued = Clock::now();
+    max_queue_depth = std::max(max_queue_depth, queue.size_approx() + 1);
+    latency.queue.record(ns_between(datagram->received, dequeued));
 
-    const auto report = vigil::decode(std::span(buffer).first(*size));
+    const auto report = vigil::decode(datagram->bytes);
+    const auto decoded = Clock::now();
     if (!report) {
       ++decode_errors;
       std::cerr << "dropping datagram: " << vigil::to_string(report.error()) << '\n';
       continue;
     }
+    latency.decode.record(ns_between(dequeued, decoded));
 
     // A report numbered 0 after traffic means the simulator restarted: start a fresh picture.
     if (last_seq && report->seq == 0) {
@@ -168,43 +291,50 @@ int main(int argc, char** argv) {
 
     // Sequence numbers wrap, so the gap is computed in unsigned 32-bit arithmetic.
     if (last_seq && report->seq != static_cast<std::uint32_t>(*last_seq + 1)) {
-      dropped += static_cast<std::uint32_t>(report->seq - *last_seq - 1);
+      missing += static_cast<std::uint32_t>(report->seq - *last_seq - 1);
     }
     last_seq = report->seq;
 
-    const auto start = std::chrono::steady_clock::now();
     const auto stats =
         tracker.process(static_cast<double>(report->timestamp_ns) * 1e-9, report->detections);
-    const double us =
-        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start)
-            .count();
-
+    const auto tracked = Clock::now();
     if (!stats) {
       ++out_of_order;
       continue;
     }
     ++reports;
-    total_us += us;
-    max_us = std::max(max_us, us);
+    const std::uint64_t track_ns = ns_between(decoded, tracked);
+    latency.track.record(track_ns);
 
     if (opt.display) {
       // Raw detections first, then the picture they produced, so a display can draw both.
-      publish(std::span(buffer).first(*size));
+      publish(datagram->bytes);
       publish(vigil::encode(vigil::tracker::make_track_report(
-          tracker, *report, static_cast<std::uint32_t>(std::lround(us * 1000.0)))));
+          tracker, *report,
+          static_cast<std::uint32_t>(
+              std::min<std::uint64_t>(track_ns, std::numeric_limits<std::uint32_t>::max())))));
     }
+    const auto published = Clock::now();
+    latency.publish.record(ns_between(tracked, published));
+    latency.total.record(ns_between(datagram->received, published));
 
+    // Printing is outside the measured path, and the receive thread keeps draining the
+    // socket however long the terminal takes.
     if (!opt.quiet) {
-      print_picture(*report, tracker, us);
+      print_picture(*report, tracker, static_cast<double>(track_ns) * 1e-3);
     }
   }
+  receiver.join();  // it has already finished: it sent the end-of-stream marker
 
-  std::cout << "\nvigil-tracker: " << reports << " reports processed, " << dropped
-            << " lost in transit, " << out_of_order << " out of order, " << decode_errors
-            << " malformed, " << display_errors << " display send errors\n";
-  if (reports > 0) {
-    std::printf("processing latency: mean %.1f us, max %.1f us\n",
-                total_us / static_cast<double>(reports), max_us);
-  }
+  // Queue drops are also sequence gaps, except for any after the last report processed.
+  std::cout << "\nvigil-tracker: " << rx_stats.datagrams << " datagrams received, " << reports
+            << " reports processed, " << rx_stats.queue_full
+            << " dropped at a full receive queue, " << missing
+            << " missing by sequence number (queue drops included), " << out_of_order
+            << " out of order, " << decode_errors << " malformed, " << display_errors
+            << " display send errors\n";
+  std::cout << "receive queue: " << queue.capacity() << " slots, high-water mark "
+            << max_queue_depth << '\n';
+  print_latency(latency);
   return 0;
 }

@@ -23,7 +23,10 @@ flowchart LR
   end
   N -- "UDP · IF-1<br/>Detection Report" --> R
   subgraph vigil-tracker
-    R[Receive + validate] --> P[Predict] --> G[Chi-square gate] --> A[Associate<br/>GNN] --> U[Kalman update] --> M[Track management<br/>tentative → confirmed → coasting]
+    R[vigil-rx thread<br/>receive + timestamp] -- "lock-free<br/>SPSC queue" --> D
+    subgraph vigil-track thread
+      D[Decode + validate] --> P[Predict] --> G[Chi-square gate] --> A[Associate<br/>GNN] --> U[Kalman update] --> M[Track management<br/>tentative → confirmed → coasting]
+    end
   end
   M -- "UDP · IF-2<br/>Detection + Track Report" --> W
   subgraph vigil-display
@@ -38,6 +41,11 @@ flowchart LR
   seed-reproducible scenario.
 - **Binary wire protocol** with a written [Interface Control Document](docs/ICD.md).
   The receiver rejects every malformed datagram case and counts lost and out-of-order reports.
+- **Two-thread pipeline**: a receive thread drains the socket and timestamps each datagram,
+  and hands it to the tracking thread through a lock-free single-producer / single-consumer
+  ring buffer (acquire/release only, no locks or compare-and-swap). If the tracker falls
+  behind, the receive thread drops and counts reports instead of blocking. A latency
+  histogram for each stage reports p50 to p99.9 when the tracker stops.
 - **Kalman filter**: constant-velocity model with discrete white-noise acceleration and a
   Joseph-form update. It uses Cholesky solves instead of explicit inverses.
 - **Data association**: chi-square gating (99%, 2 DoF) through a spatial grid, then
@@ -57,7 +65,7 @@ flowchart LR
   - **Show all** (or F) glides out to frame every track. Selecting an off-screen track glides
     the view to it. R recentres on the sensor, and Esc clears the selection.
   - The layout adapts to phones, and it respects reduced-motion settings.
-- **Engineering**: CMake presets, GoogleTest (44 tests), Vitest, Google Benchmark,
+- **Engineering**: CMake presets, GoogleTest (56 tests), Vitest, Google Benchmark,
   AddressSanitizer, UBSan, ThreadSanitizer, clang-tidy and GitHub Actions CI.
 
 ## Quick start
@@ -150,6 +158,33 @@ The grid is an optimisation only. Tests run the tracker with and without it over
 scenario and check the track pictures are bit-for-bit identical. Set
 `TrackerConfig::spatial_index = false` to compare.
 
+### End-to-end latency
+
+`vigil-tracker` times every report through each stage and prints a table when it stops.
+Here it ran 1,000 reports from 50 targets plus clutter at 50 Hz, on the same machine:
+
+| Stage (µs) | p50 | p99 | p50 with `--spin` | p99 with `--spin` |
+|---|---:|---:|---:|---:|
+| Queue wait (socket → tracker thread) | 34.8 | 65.5 | **0.7** | **3.8** |
+| Decode | 1.7 | 3.7 | 1.3 | 4.0 |
+| Track | 34.8 | 55.3 | 31.7 | 55.3 |
+| Publish to display | 30.7 | 59.4 | 27.6 | 69.6 |
+| **Socket to display** | **102** | **172** | **61** | **119** |
+
+By default the tracker thread sleeps in the kernel when the queue is empty, so each report
+pays for a thread wake-up of about 35 µs. `--spin` makes it busy-poll the queue instead, which
+cuts that to under a microsecond at the price of keeping one core at 100%. That's the usual
+latency-versus-CPU trade-off in a real-time system, and it's a single flag.
+
+When the simulator floods the tracker (`vigil-sim --fast`), the 256-slot queue fills and the
+receive thread drops reports rather than block. In one run, 3,145 of 20,000 reports were
+dropped at the queue, and the tracker's sequence-number check counted exactly 3,145 missing.
+
+The queue itself (`vigil_bench --benchmark_filter=Queue`) moves 20 M values per second between
+two threads, against 5.7 M for a `std::deque` behind a `std::mutex`. At that rate each value
+costs about 50 ns, which is roughly the time to move a cache line between two cores of the
+Ryzen 3900X.
+
 ## Testing
 
 | Preset | Purpose |
@@ -161,8 +196,9 @@ scenario and check the track pictures are bit-for-bit identical. Set
 | `tsan` | ThreadSanitizer |
 
 The suite covers the wire format (including every malformed-datagram case), loopback UDP,
-target motion, filter convergence and covariance health, and the track lifecycle. An
-end-to-end test runs the tracker against 8 simulated targets through clutter and missed
+the lock-free queue (a million values through an 8-slot ring across two threads, also run
+under ThreadSanitizer), latency-histogram precision, target motion, filter convergence and
+covariance health, and the track lifecycle. An end-to-end test runs the tracker against 8 simulated targets through clutter and missed
 detections, and checks that every target ends with exactly one firm track.
 
 The display's decoder has its own tests (`cd display && npm test`). They build datagrams
@@ -175,7 +211,7 @@ TypeScript sides are both checked against the same document.
 - [ ] **M2**: performance and concurrency
   - [x] spatial-grid gating: 1,024 targets from 141 ms to 0.47 ms per scan
   - [ ] optimal assignment (Hungarian / auction)
-  - [ ] multithreaded receive → process pipeline with a lock-free queue, and a latency
+  - [x] multithreaded receive → process pipeline with a lock-free queue, and a latency
         histogram for each stage
 - [x] **M3**: React radar-scope display over WebSocket
 - [ ] **M3.1**: truth overlay and OSPA accuracy scoring against it
@@ -185,7 +221,7 @@ TypeScript sides are both checked against the same document.
 ## Layout
 
 ```
-common/   wire format (encode/decode) and RAII UDP socket
+common/   wire format (encode/decode), RAII UDP socket, SPSC queue, latency histogram
 sim/      scenario + sensor model library, vigil-sim executable
 tracker/  Kalman filter, track manager, display publisher, vigil-tracker executable
 tests/    GoogleTest suite
