@@ -4,6 +4,6 @@ if(NOT benchmark_FOUND)
   return()
 endif()
 
-add_executable(vigil_bench bench_tracker.cpp bench_queue.cpp)
+add_executable(vigil_bench bench_tracker.cpp bench_queue.cpp bench_auth.cpp)
 target_link_libraries(vigil_bench PRIVATE vigil::tracker vigil::sim benchmark::benchmark_main
                                         vigil_options)

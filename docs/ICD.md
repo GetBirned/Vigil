@@ -3,9 +3,9 @@
 | Item | Value |
 |---|---|
 | Document | VIGIL-ICD-001 |
-| Revision | 2 (protocol version 1) |
+| Revision | 3 (protocol version 1, envelope version 1) |
 | Interfaces | IF-1 sensor → tracker (Detection Report) · IF-2 tracker → display (Detection Report + Track Report) |
-| Source of truth in code | `common/include/vigil/messages.hpp`, `common/src/messages.cpp` (C++), `display/src/shared/protocol.ts` (TypeScript) |
+| Source of truth in code | `common/include/vigil/messages.hpp`, `common/src/messages.cpp` (C++), `display/src/shared/protocol.ts` (TypeScript); authentication: `common/include/vigil/auth.hpp`, `common/src/auth.cpp`, `display/server/auth.ts` |
 
 ## 1. Interfaces and transport
 
@@ -58,8 +58,9 @@ Detections carry no target identity. Their order within a report is arbitrary.
 
 ### 4.2 Size
 
-`datagram size = 24 + 16 × count`. With a 1472-byte limit, `count ≤ 90`. A producer with more
-detections in one scan must drop the excess. Version 1 has no fragmentation.
+`datagram size = 24 + 16 × count`. With a 1472-byte limit, `count ≤ 90`, or `count ≤ 88` inside
+an authenticated envelope (section 7), which adds 40 bytes. A producer with more detections in
+one scan must drop the excess. Version 1 has no fragmentation.
 
 ## 5. Track Report (type 2)
 
@@ -110,7 +111,82 @@ A receiver must discard the whole datagram, and count it as malformed, if any ch
 The tracker discards Detection Reports whose `timestamp_ns` is older than the last report it
 processed, and counts them as out of order.
 
-## 7. Example
+## 7. Security: authenticated envelope
+
+### 7.1 Threat model
+
+Both interfaces are plain UDP, so without protection anyone who can reach the receiver's port
+can feed it data. The envelope defends against:
+
+| Attacker | Can | Without the envelope | With it |
+|---|---|---|---|
+| Off-path spoofer | Send datagrams to the port; sees no traffic | Injects ghost targets. One report with a far-future `timestamp_ns` makes the tracker discard every genuine report after it as out of order. | Rejected: not authenticated, or wrong key |
+| On-path (man in the middle) | Read, modify, delay, reorder, replay and drop traffic | Adds or moves detections; replays old scans | Modified: tag mismatch. Replayed: replay window. |
+| Replay after restart | Re-send traffic captured in an earlier run | Restarts the picture (a report with `seq = 0`) | Rejected: stale epoch |
+
+Out of scope: **confidentiality** (payloads are readable; add DTLS or IPsec if they must not
+be), **denial of service** (an on-path attacker can always drop traffic; authentication turns
+tampering into loss, not deception), and **key distribution** (the key is provisioned out of
+band as a file).
+
+### 7.2 Format
+
+Each message from sections 3 to 5 travels unchanged as the payload of an envelope:
+
+| Offset | Size | Type | Field | Notes |
+|---|---|---|---|---|
+| 0 | 4 | u32 | `magic` | `0x56474C53` ("VGLS" when read as little-endian bytes `53 4C 47 56`) |
+| 4 | 2 | u16 | `env_version` | 1 |
+| 6 | 2 | u16 | `key_id` | First 2 bytes (little-endian) of HMAC-SHA256(key, ASCII `vigil key id`) |
+| 8 | 8 | u64 | `epoch` | Sender's start time, ns since the Unix epoch. Must increase across restarts. |
+| 16 | 8 | u64 | `counter` | 0 for the first datagram of an epoch, then +1 per datagram |
+| 24 | n | bytes | `payload` | One message, exactly as in sections 3 to 5 |
+| 24 + n | 16 | bytes | `tag` | HMAC-SHA256(key, bytes 0 to 24 + n − 1), first 16 bytes |
+
+The key is 32 random bytes, stored as 64 hex digits in a file only its owner can read
+(`openssl rand -hex 32`, mode 0600). The tag is truncated to 128 bits, as in IPsec
+(RFC 4868). On IF-2 the tracker seals with its own epoch and counter: it re-seals the Detection
+Report it forwards rather than passing the sensor's envelope on.
+
+### 7.3 Receiver behaviour
+
+Checks run in this order. A datagram that fails any of them is discarded and counted by reason,
+and nothing about the receiver's state changes:
+
+| # | Check | Error |
+|---|---|---|
+| 1 | Starts with the envelope `magic` | not authenticated |
+| 2 | At least 40 bytes | too short |
+| 3 | `env_version` = 1 | unsupported envelope version |
+| 4 | `key_id` matches the receiver's key | wrong key |
+| 5 | (`epoch`, `counter`) passes the replay window | stale epoch, too old, replayed |
+| 6 | `tag` matches, compared in **constant time** | bad tag |
+
+Only after check 6 does the replay window record the datagram, so forged traffic can never move
+it. The window follows RFC 4303 section 3.4.3: it remembers the highest `counter` accepted and a
+64-bit bitmap of the 63 before it. A counter above the top is accepted and slides the window. A
+counter inside it is accepted once. Anything older is rejected. A higher `epoch` means the
+sender restarted, and resets the window. A lower one is rejected.
+
+The payload is then validated as in section 6. Rejections are logged at most once per second,
+so a flood of forgeries cannot flood the log. `vigil-tracker` authenticates on its receive
+thread, before the queue, so forgeries cost one HMAC (about 1 µs) and never displace genuine
+reports from the queue. Running without authentication requires an explicit `--insecure`.
+
+### 7.4 Example
+
+Key `00 01 02 … 1F` (`key_id` = `0x1495`), `epoch` = 1, `counter` = 0, payload ASCII `abc`:
+
+```
+53 4C 47 56  01 00  95 14  01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+61 62 63
+63 35 89 50 B8 13 E9 54 BC D5 C0 7A 59 DA 7D 7E
+```
+
+The C++ and TypeScript tests both check this vector, which was generated independently with
+Python's `hmac` module.
+
+## 8. Example
 
 A Detection Report with `seq = 0xDEADBEEF`, `sensor_id = 7`, one detection at (1.5, −2.25):
 
@@ -119,9 +195,10 @@ A Detection Report with `seq = 0xDEADBEEF`, `sensor_id = 7`, one detection at (1
 00 00 00 00 00 00 F8 3F   00 00 00 00 00 00 02 C0
 ```
 
-## 8. Revision history
+## 9. Revision history
 
 | Rev | Date | Change |
 |---|---|---|
 | 1 | 2026-10-27 | Initial release: IF-1, Detection Report |
 | 2 | 2026-10-28 | Added IF-2 and the Track Report (type 2). Protocol version unchanged: type 1 is identical |
+| 3 | 2026-10-28 | Added the authenticated envelope and threat model (section 7). Messages unchanged |

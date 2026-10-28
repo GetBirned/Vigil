@@ -1,6 +1,9 @@
 // Display gateway: listens for the tracker's UDP display feed, pairs each scan's
 // detections with the track picture they produced, and pushes JSON frames to browsers
 // over WebSocket. With --static DIR it also serves the built web app.
+//
+// The feed must be authenticated with the tracker's key (--key-file, or VIGIL_KEY_FILE)
+// unless --insecure (or VIGIL_INSECURE=1) is given.
 
 import { createSocket } from "node:dgram";
 import { readFile } from "node:fs/promises";
@@ -10,17 +13,42 @@ import { parseArgs } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { decodeDatagram, type Detection, type Frame } from "../src/shared/protocol.ts";
+import { keyId, loadKeyFile, Opener } from "./auth.ts";
 
 const { values: args } = parseArgs({
   options: {
     "udp-port": { type: "string", default: "50001" },
     "ws-port": { type: "string", default: process.env.VIGIL_WS_PORT ?? "8081" },
     static: { type: "string" },
+    "key-file": { type: "string", default: process.env.VIGIL_KEY_FILE },
+    insecure: { type: "boolean", default: process.env.VIGIL_INSECURE === "1" },
   },
 });
 const udpPort = Number(args["udp-port"]);
 const wsPort = Number(args["ws-port"]);
 const staticDir = args.static ? resolve(args.static) : undefined;
+
+// No silent default: running without authentication has to be asked for.
+if (Boolean(args["key-file"]) === args.insecure) {
+  console.error(
+    "gateway: choose one: --key-file PATH (or VIGIL_KEY_FILE) to require an authenticated feed, " +
+      "or --insecure (or VIGIL_INSECURE=1)",
+  );
+  process.exit(2);
+}
+let opener: Opener | undefined;
+if (args["key-file"]) {
+  try {
+    const key = loadKeyFile(args["key-file"]);
+    opener = new Opener(key);
+    console.log(`gateway: accepting only feeds authenticated with key ${keyId(key).toString(16).padStart(4, "0")}`);
+  } catch (err) {
+    console.error(`gateway: ${(err as Error).message}`);
+    process.exit(2);
+  }
+} else {
+  console.warn("gateway: WARNING: --insecure: accepting an unauthenticated feed");
+}
 
 // Drop frames for a browser that has fallen this far behind rather than queue forever.
 const MAX_BUFFERED_BYTES = 1 << 20;
@@ -88,10 +116,23 @@ function broadcast(frame: Frame): void {
 // The tracker sends a scan's detections, then the track report for the same scan.
 let pending: { seq: number; detections: Detection[] } | undefined;
 let malformed = 0;
+let rejected = 0;
 
 const udp = createSocket("udp4");
 
-udp.on("message", (msg) => {
+udp.on("message", (datagram) => {
+  let msg = datagram;
+  if (opener) {
+    const opened = opener.open(datagram);
+    if (!opened.ok) {
+      rejected++;
+      if (rejected === 1 || rejected % 100 === 0) {
+        console.warn(`gateway: rejected datagram (${opened.reason}); ${rejected} so far`);
+      }
+      return;
+    }
+    msg = opened.payload;
+  }
   const decoded = decodeDatagram(msg);
   switch (decoded.kind) {
     case "error":

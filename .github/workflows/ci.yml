@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 ninja-build libeigen3-dev libgtest-dev libbenchmark-dev
+          sudo apt-get install -y g++-14 ninja-build libeigen3-dev libgtest-dev libbenchmark-dev libssl-dev
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=g++-14

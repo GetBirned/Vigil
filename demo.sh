@@ -6,6 +6,7 @@
 #   ./demo.sh                          # 8 targets, light clutter
 #   ./demo.sh --targets 20 --clutter 6 # any other options go to vigil-sim
 #   ./demo.sh --no-open                # don't open a browser
+#   ./demo.sh --insecure               # turn authentication off (see tools/attacker.py)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,12 +15,14 @@ LOGS="$ROOT/build/demo"
 URL="http://localhost:5173"
 
 open_browser=1
+insecure=0
 sim_args=()
 for arg in "$@"; do
   case "$arg" in
     --no-open) open_browser=0 ;;
+    --insecure) insecure=1 ;;
     -h | --help)
-      sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) sim_args+=("$arg") ;;
@@ -58,6 +61,22 @@ fi
 
 mkdir -p "$LOGS"
 
+# Every link is authenticated with one shared key, generated on first run and readable only
+# by you. tools/attacker.py uses the same file to know which key it does NOT have.
+KEY="$LOGS/vigil.key"
+if ((insecure)); then
+  auth=(--insecure)
+  export VIGIL_INSECURE=1
+  say "WARNING: authentication is OFF (--insecure)"
+else
+  if [[ ! -s "$KEY" ]]; then
+    say "generating a key for this machine: ${KEY#"$ROOT/"}"
+    (umask 077 && openssl rand -hex 32 >"$KEY")
+  fi
+  auth=(--key-file "$KEY")
+  export VIGIL_KEY_FILE="$KEY"
+fi
+
 # ------------------------------------------------------------ start + cleanup
 
 pids=()
@@ -84,7 +103,7 @@ cleanup() {
   done
   for pid in "${pids[@]}"; do kill -KILL -- "-$pid" 2>/dev/null || true; done
   if [[ -s "$LOGS/tracker.log" ]]; then
-    grep -E "reports processed|processing latency" "$LOGS/tracker.log" | sed 's/^/  /' || true
+    grep -E "reports processed|^rejected:" "$LOGS/tracker.log" | sed 's/^/  /' || true
   fi
   say "logs are in ${LOGS#"$ROOT/"}/"
 }
@@ -116,7 +135,7 @@ wait_for_port 8081 "display gateway" display.log
 wait_for_port 5173 "web app" display.log
 
 say "starting tracker..."
-start tracker "$BUILD/tracker/vigil-tracker" --quiet
+start tracker "$BUILD/tracker/vigil-tracker" --quiet "${auth[@]}"
 sleep 0.3
 kill -0 "${pids[-1]}" 2>/dev/null || die "tracker exited early; see ${LOGS#"$ROOT/"}/tracker.log"
 
@@ -133,7 +152,7 @@ say "starting simulator: vigil-sim ${sim_args[*]}   (Ctrl-C to stop everything)"
 echo
 # Run in the background and `wait`, because bash defers traps until a foreground
 # command finishes; `wait` returns as soon as Ctrl-C arrives, so cleanup runs at once.
-"$BUILD/sim/vigil-sim" "${sim_args[@]}" &
+"$BUILD/sim/vigil-sim" "${auth[@]}" "${sim_args[@]}" &
 sim_pid=$!
 wait "$sim_pid" || true
 sim_pid=""

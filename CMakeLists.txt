@@ -18,6 +18,7 @@ set_property(CACHE VIGIL_SANITIZER PROPERTY STRINGS "" address thread)
 
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 find_package(Threads REQUIRED)
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
 
 # Project-wide compile settings, attached to every target we build.
 add_library(vigil_options INTERFACE)

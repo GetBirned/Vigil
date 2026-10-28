@@ -21,14 +21,14 @@ flowchart LR
   subgraph vigil-sim
     S[Scenario<br/>CV + coordinated-turn truth] --> N[Sensor model<br/>noise, Pd, clutter]
   end
-  N -- "UDP · IF-1<br/>Detection Report" --> R
+  N -- "UDP · IF-1 · HMAC-sealed<br/>Detection Report" --> R
   subgraph vigil-tracker
-    R[vigil-rx thread<br/>receive + timestamp] -- "lock-free<br/>SPSC queue" --> D
+    R[vigil-rx thread<br/>receive + authenticate] -- "lock-free<br/>SPSC queue" --> D
     subgraph vigil-track thread
       D[Decode + validate] --> P[Predict] --> G[Chi-square gate] --> A[Associate<br/>GNN] --> U[Kalman update] --> M[Track management<br/>tentative → confirmed → coasting]
     end
   end
-  M -- "UDP · IF-2<br/>Detection + Track Report" --> W
+  M -- "UDP · IF-2 · HMAC-sealed<br/>Detection + Track Report" --> W
   subgraph vigil-display
     W[Gateway<br/>Node · UDP → WebSocket] -- JSON frames --> B[React PPI scope<br/>canvas]
   end
@@ -41,6 +41,12 @@ flowchart LR
   seed-reproducible scenario.
 - **Binary wire protocol** with a written [Interface Control Document](docs/ICD.md).
   The receiver rejects every malformed datagram case and counts lost and out-of-order reports.
+- **Authenticated datagrams**: every UDP link is sealed with HMAC-SHA256 (OpenSSL, 128-bit
+  tag, constant-time comparison) and an IPsec-style 64-entry replay window, with an epoch so
+  traffic captured from an earlier run can't be replayed into this one. Forged, tampered and
+  replayed datagrams are rejected and counted by reason. Nothing runs unauthenticated unless
+  you pass `--insecure`. `tools/attacker.py` demonstrates the attacks it stops; see
+  [Security](#security).
 - **Two-thread pipeline**: a receive thread drains the socket and timestamps each datagram,
   and hands it to the tracking thread through a lock-free single-producer / single-consumer
   ring buffer (acquire/release only, no locks or compare-and-swap). If the tracker falls
@@ -65,7 +71,7 @@ flowchart LR
   - **Show all** (or F) glides out to frame every track. Selecting an off-screen track glides
     the view to it. R recentres on the sensor, and Esc clears the selection.
   - The layout adapts to phones, and it respects reduced-motion settings.
-- **Engineering**: CMake presets, GoogleTest (56 tests), Vitest, Google Benchmark,
+- **Engineering**: CMake presets, GoogleTest (70 tests), Vitest (16 tests), Google Benchmark,
   AddressSanitizer, UBSan, ThreadSanitizer, clang-tidy and GitHub Actions CI.
 
 ## Quick start
@@ -73,7 +79,7 @@ flowchart LR
 Requires Linux (or WSL2), GCC 13+ or Clang 17+, CMake 3.25+, Ninja and Node.js 20+.
 
 ```bash
-sudo apt install -y build-essential cmake ninja-build libeigen3-dev libgtest-dev libbenchmark-dev nodejs npm
+sudo apt install -y build-essential cmake ninja-build libeigen3-dev libgtest-dev libbenchmark-dev libssl-dev nodejs npm
 ./demo.sh
 ```
 
@@ -81,6 +87,10 @@ sudo apt install -y build-essential cmake ninja-build libeigen3-dev libgtest-dev
 the scope at <http://localhost:5173>. Ctrl-C stops all of them. Any options go to the
 simulator, for example `./demo.sh --targets 20 --clutter 6`. Add `--no-open` to skip opening a
 browser. Logs go to `build/demo/`.
+
+On its first run, `demo.sh` generates a random key in `build/demo/vigil.key`, readable only by
+you, and every process uses it. `./demo.sh --insecure` turns authentication off, which is only
+useful for watching the attacks in [Security](#security) succeed.
 
 ### Running the pieces by hand
 
@@ -90,11 +100,12 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-Run the tracker and the simulator in two terminals:
+Make a key once, then run the tracker and the simulator in two terminals:
 
 ```bash
-./build/release/tracker/vigil-tracker
-./build/release/sim/vigil-sim --targets 5 --rate 1
+(umask 077 && openssl rand -hex 32 > vigil.key)
+./build/release/tracker/vigil-tracker --key-file vigil.key
+./build/release/sim/vigil-sim --key-file vigil.key --targets 5 --rate 1
 ```
 
 ```
@@ -117,7 +128,7 @@ Requires Node.js 20+. In a third terminal:
 ```bash
 cd display
 npm install
-npm run dev
+VIGIL_KEY_FILE=../vigil.key npm run dev
 ```
 
 Open <http://localhost:5173>. The gateway listens for the tracker's display feed on UDP 50001
@@ -185,6 +196,53 @@ two threads, against 5.7 M for a `std::deque` behind a `std::mutex`. At that rat
 costs about 50 ns, which is roughly the time to move a cache line between two cores of the
 Ryzen 3900X.
 
+## Security
+
+UDP has no notion of who sent a datagram, so out of the box anyone who can reach the tracker's
+port can feed it targets. Every Vigil link therefore wraps its messages in an authenticated
+envelope. The [ICD's security section](docs/ICD.md#7-security-authenticated-envelope) has the
+threat model and the byte layout. In short:
+
+- **HMAC-SHA256 tag** over the whole datagram, truncated to 128 bits as in IPsec, using
+  OpenSSL rather than hand-written crypto. Tags are compared in constant time
+  (`CRYPTO_memcmp`, `crypto.timingSafeEqual`), so response timing doesn't reveal how much of a
+  forged tag was right.
+- **Replay window** (RFC 4303): each (epoch, counter) is accepted once. Reordering within the
+  last 64 is tolerated. The window only moves after the tag verifies, so forgeries can't push
+  it forward and lock out genuine traffic.
+- **Epoch** set from the sender's start time, so traffic captured from an earlier run is
+  rejected after a restart instead of resetting the picture.
+- **Fail closed**: the simulator, tracker and gateway all refuse to start without a key unless
+  you pass `--insecure`. Key files that other users can read are refused, like ssh does.
+- **Verified before the queue**: the tracker authenticates on its receive thread, so a flood
+  of forgeries costs about 1 µs each and never crowds genuine reports out of the queue.
+  Rejections are logged at most once a second.
+
+### Attacking it
+
+`tools/attacker.py` has two attackers. **spoof** is off-path: it forges reports for a ghost
+target flying at the sensor, with a far-future timestamp. **mitm** sits between the simulator
+and the tracker: it forwards everything, but first sends a copy with a ghost detection added,
+and replays every datagram a few seconds later.
+
+```bash
+./demo.sh                          # in one terminal
+tools/attacker.py spoof            # in another
+
+./demo.sh --port 50002             # sim -> attacker -> tracker
+tools/attacker.py mitm
+```
+
+Results from short runs with 3 targets, with and without `--insecure`:
+
+| Attack | Without authentication | With authentication |
+|---|---|---|
+| spoof | The ghost is the **only** track left. Its timestamp made the tracker discard all 51 genuine reports that followed as out of order. | Picture unchanged. 8 of 8 forgeries rejected: not authenticated. |
+| mitm | The ghost becomes a track, real tracks split into duplicates, and replays create a stationary phantom. | Picture unchanged. 40 of 40 tampered copies rejected as bad tag, 40 of 40 replays rejected as replayed. |
+
+Authentication costs about 1 µs per full detection report (`vigil_bench --benchmark_filter=Seal|Open`).
+In the live pipeline, the median time from socket to display was the same with and without it.
+
 ## Testing
 
 | Preset | Purpose |
@@ -198,12 +256,16 @@ Ryzen 3900X.
 The suite covers the wire format (including every malformed-datagram case), loopback UDP,
 the lock-free queue (a million values through an 8-slot ring across two threads, also run
 under ThreadSanitizer), latency-histogram precision, target motion, filter convergence and
-covariance health, and the track lifecycle. An end-to-end test runs the tracker against 8 simulated targets through clutter and missed
-detections, and checks that every target ends with exactly one firm track.
+covariance health, the track lifecycle, and authentication: a known-answer vector, every
+single-bit flip and every truncation of a sealed datagram rejected without disturbing the
+replay window, replays, reordering, restarts and key-file permissions. An end-to-end test runs
+the tracker against 8 simulated targets through clutter and missed detections, and checks that
+every target ends with exactly one firm track.
 
 The display's decoder has its own tests (`cd display && npm test`). They build datagrams
 byte by byte from the ICD tables, including the ICD's worked example, so the C++ and
-TypeScript sides are both checked against the same document.
+TypeScript sides are both checked against the same document. The gateway's authentication
+tests check the same known-answer vector as the C++ tests.
 
 ## Roadmap
 
@@ -215,17 +277,20 @@ TypeScript sides are both checked against the same document.
         histogram for each stage
 - [x] **M3**: React radar-scope display over WebSocket
 - [ ] **M3.1**: truth overlay and OSPA accuracy scoring against it
-- [ ] **M4**: authenticated datagrams (HMAC + replay window), a hardened systemd service, and a
-      Raspberry Pi acting as a remote sensor node
+- [ ] **M4**: security and deployment
+  - [x] authenticated datagrams: HMAC-SHA256, replay window and epochs, with an attack demo
+  - [ ] a hardened systemd service (sandboxing, no privileges, key from a credential)
+  - [ ] a Raspberry Pi acting as a remote sensor node
 
 ## Layout
 
 ```
-common/   wire format (encode/decode), RAII UDP socket, SPSC queue, latency histogram
+common/   wire format, authenticated envelope, RAII UDP socket, SPSC queue, latency histogram
 sim/      scenario + sensor model library, vigil-sim executable
 tracker/  Kalman filter, track manager, display publisher, vigil-tracker executable
 tests/    GoogleTest suite
 bench/    Google Benchmark suite
 display/  UDP → WebSocket gateway (Node) and React radar scope (Vite + TypeScript)
+tools/    attacker.py: spoofing and man-in-the-middle attacks for the security demo
 docs/     Interface Control Document; brand/ holds the logo (master PNG + white, ink, teal SVGs)
 ```

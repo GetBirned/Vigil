@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <iostream>
 #include <limits>
 #include <numbers>
@@ -31,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "vigil/auth.hpp"
 #include "vigil/latency_histogram.hpp"
 #include "vigil/messages.hpp"
 #include "vigil/spsc_queue.hpp"
@@ -57,12 +59,15 @@ constexpr std::size_t kQueueDepth = 256;
 struct Datagram {
   std::vector<std::byte> bytes;
   Clock::time_point received;
+  Clock::time_point authenticated;  // same as `received` when running --insecure
   bool end_of_stream = false;  // queued once, last, when the receive thread stops
 };
 
 struct ReceiveStats {
   std::uint64_t datagrams = 0;
   std::uint64_t queue_full = 0;  // dropped because the tracker had fallen behind
+  // Failed authentication, by reason (indexed by vigil::auth::AuthError).
+  std::array<std::uint64_t, vigil::auth::kAuthErrorCount> rejected{};
 };
 
 // Shows up in top -H, perf and gdb's thread list.
@@ -81,6 +86,8 @@ struct Options {
   bool display = true;
   bool quiet = false;
   bool spin = false;
+  std::string key_file;   // accept only datagrams sealed with this key
+  bool insecure = false;  // or explicitly accept unauthenticated datagrams
 };
 
 void print_usage() {
@@ -92,7 +99,10 @@ void print_usage() {
                "  --no-display         don't publish a display feed\n"
                "  --quiet              don't print the track table each scan\n"
                "  --spin               busy-poll the receive queue instead of sleeping:\n"
-               "                       lower latency, but keeps one core at 100%\n";
+               "                       lower latency, but keeps one core at 100%\n"
+               "  --key-file PATH      accept only datagrams authenticated with this key, and\n"
+               "                       authenticate the display feed with it too\n"
+               "  --insecure           accept unauthenticated datagrams instead\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -121,6 +131,10 @@ Options parse_args(int argc, char** argv) {
       opt.quiet = true;
     } else if (arg == "--spin") {
       opt.spin = true;
+    } else if (arg == "--key-file") {
+      opt.key_file = value();
+    } else if (arg == "--insecure") {
+      opt.insecure = true;
     } else if (arg == "--help" || arg == "-h") {
       print_usage();
       std::exit(0);
@@ -128,6 +142,11 @@ Options parse_args(int argc, char** argv) {
       std::cerr << "unknown option " << arg << '\n';
       std::exit(2);
     }
+  }
+  // No silent default: running without authentication has to be asked for.
+  if (opt.key_file.empty() == !opt.insecure) {
+    std::cerr << "choose one: --key-file PATH to require authenticated datagrams, or --insecure\n";
+    std::exit(2);
   }
   return opt;
 }
@@ -161,26 +180,53 @@ void print_picture(const vigil::DetectionReport& report, const vigil::tracker::T
 // The vigil-rx thread. Never blocks on the tracker: if the queue is full, the newest datagram
 // is dropped and counted. Stalling here instead would only move the loss into the kernel's
 // socket buffer, where nobody can see it.
+//
+// Authentication happens here, before the queue, so forged traffic costs one HMAC and can't
+// crowd genuine reports out of the queue or reach the decoder at all.
 ReceiveStats receive_loop(const std::stop_token& stop, vigil::UdpSocket& socket,
-                          vigil::SpscQueue<Datagram>& queue) {
+                          vigil::SpscQueue<Datagram>& queue,
+                          std::optional<vigil::auth::Opener> opener) {
   name_this_thread("vigil-rx");
   ReceiveStats stats;
   std::array<std::byte, 65'536> buffer{};
+  std::optional<Clock::time_point> last_warning;
   while (!stop.stop_requested() && !g_stop.load(std::memory_order_relaxed)) {
     const auto size = socket.receive(buffer, std::chrono::milliseconds(200));
     if (!size) {
       continue;
     }
-    Datagram datagram{.bytes = {buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*size)},
-                      .received = Clock::now()};
+    const auto received = Clock::now();
     ++stats.datagrams;
+
+    std::span<const std::byte> message = std::span(buffer).first(*size);
+    if (opener) {
+      const auto opened = opener->open(message);
+      if (!opened) {
+        const auto reason = static_cast<std::size_t>(opened.error());
+        ++stats.rejected[reason];
+        // At most one line a second, so a flood of forgeries can't flood the log too.
+        if (!last_warning || received - *last_warning >= std::chrono::seconds(1)) {
+          last_warning = received;
+          std::fprintf(stderr, "vigil-rx: rejected datagram: %s (%llu for this reason so far)\n",
+                       std::string(vigil::auth::to_string(opened.error())).c_str(),
+                       static_cast<unsigned long long>(stats.rejected[reason]));
+        }
+        continue;
+      }
+      message = *opened;
+    }
+
+    Datagram datagram{.bytes = {message.begin(), message.end()},
+                      .received = received,
+                      .authenticated = opener ? Clock::now() : received};
     if (!queue.try_push(std::move(datagram))) {
       ++stats.queue_full;
     }
   }
   // Tell the tracker nothing more is coming. It is draining the queue, so this only waits
   // while the queue is full, and gives up if the tracker itself is shutting down.
-  Datagram end{.bytes = {}, .received = Clock::now(), .end_of_stream = true};
+  Datagram end{
+      .bytes = {}, .received = Clock::now(), .authenticated = Clock::now(), .end_of_stream = true};
   while (!queue.try_push(std::move(end)) && !stop.stop_requested()) {
     std::this_thread::yield();
   }
@@ -188,7 +234,8 @@ ReceiveStats receive_loop(const std::stop_token& stop, vigil::UdpSocket& socket,
 }
 
 struct StageLatency {
-  vigil::LatencyHistogram queue;    // arrival on the socket -> picked up by the tracker
+  vigil::LatencyHistogram authenticate;  // HMAC and replay check, on the receive thread
+  vigil::LatencyHistogram queue;    // authenticated -> picked up by the tracker
   vigil::LatencyHistogram decode;   // datagram -> DetectionReport
   vigil::LatencyHistogram track;    // predict, gate, associate, update, manage
   vigil::LatencyHistogram publish;  // encode and send to the display
@@ -205,6 +252,9 @@ void print_latency(const StageLatency& latency) {
     std::printf("  %-22s %9.1f %9.1f %9.1f %9.1f %9.1f\n", name, us(h.quantile(0.5)),
                 us(h.quantile(0.9)), us(h.quantile(0.99)), us(h.quantile(0.999)), us(h.max()));
   };
+  if (latency.authenticate.max() > 0) {
+    row("authenticate", latency.authenticate);
+  }
   row("queue wait", latency.queue);
   row("decode", latency.decode);
   row("track", latency.track);
@@ -228,12 +278,33 @@ int main(int argc, char** argv) {
               << '\n';
   }
 
+  // The receive thread verifies incoming datagrams; this thread seals the display feed.
+  std::optional<vigil::auth::Opener> opener;
+  std::optional<vigil::auth::Sealer> display_sealer;
+  if (opt.insecure) {
+    std::cout << "vigil-tracker: WARNING: --insecure: accepting unauthenticated datagrams\n";
+  } else {
+    const auto key = vigil::auth::load_key_file(opt.key_file);
+    if (!key) {
+      std::cerr << "vigil-tracker: " << key.error() << '\n';
+      return 2;
+    }
+    opener.emplace(*key);
+    display_sealer.emplace(*key, vigil::auth::epoch_now());
+    std::cout << "vigil-tracker: accepting only datagrams authenticated with key "
+              << std::format("{:04x}", key->id()) << '\n';
+  }
+
   vigil::UdpSocket display_socket;
   std::uint64_t display_errors = 0;
   // The display is optional: a send failure is counted, never fatal.
-  auto publish = [&](std::span<const std::byte> datagram) {
+  auto publish = [&](std::span<const std::byte> message) {
     try {
-      display_socket.send_to(opt.display_host, opt.display_port, datagram);
+      if (display_sealer) {
+        display_socket.send_to(opt.display_host, opt.display_port, display_sealer->seal(message));
+      } else {
+        display_socket.send_to(opt.display_host, opt.display_port, message);
+      }
     } catch (const std::system_error&) {
       ++display_errors;
     }
@@ -242,8 +313,9 @@ int main(int argc, char** argv) {
   vigil::SpscQueue<Datagram> queue(kQueueDepth);
   ReceiveStats rx_stats;
   // Asked to stop and joined when it goes out of scope, including if the tracker throws.
-  std::jthread receiver(
-      [&](const std::stop_token& stop) { rx_stats = receive_loop(stop, socket, queue); });
+  std::jthread receiver([&, opener = std::move(opener)](const std::stop_token& stop) mutable {
+    rx_stats = receive_loop(stop, socket, queue, std::move(opener));
+  });
   name_this_thread("vigil-track");
 
   vigil::tracker::TrackManager tracker;
@@ -271,7 +343,8 @@ int main(int argc, char** argv) {
     }
     const auto dequeued = Clock::now();
     max_queue_depth = std::max(max_queue_depth, queue.size_approx() + 1);
-    latency.queue.record(ns_between(datagram->received, dequeued));
+    latency.authenticate.record(ns_between(datagram->received, datagram->authenticated));
+    latency.queue.record(ns_between(datagram->authenticated, dequeued));
 
     const auto report = vigil::decode(datagram->bytes);
     const auto decoded = Clock::now();
@@ -335,6 +408,12 @@ int main(int argc, char** argv) {
             << " display send errors\n";
   std::cout << "receive queue: " << queue.capacity() << " slots, high-water mark "
             << max_queue_depth << '\n';
+  for (std::size_t reason = 0; reason < rx_stats.rejected.size(); ++reason) {
+    if (rx_stats.rejected[reason] > 0) {
+      std::cout << "rejected: " << rx_stats.rejected[reason] << ' '
+                << vigil::auth::to_string(static_cast<vigil::auth::AuthError>(reason)) << '\n';
+    }
+  }
   print_latency(latency);
   return 0;
 }

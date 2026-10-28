@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 
+#include "vigil/auth.hpp"
 #include "vigil/messages.hpp"
 #include "vigil/sim/scenario.hpp"
 #include "vigil/udp.hpp"
@@ -28,6 +30,8 @@ struct Options {
   std::uint64_t seed = 1;
   std::uint64_t scans = 0;  // 0 = run until Ctrl-C
   bool fast = false;        // send as fast as possible instead of in real time
+  std::string key_file;     // seal every report with this key
+  bool insecure = false;    // or explicitly send unauthenticated reports
   vigil::sim::SensorConfig sensor;
 };
 
@@ -42,7 +46,9 @@ void print_usage() {
                "  --pd P           probability of detection (default 0.95)\n"
                "  --clutter N      mean false alarms per scan (default 2)\n"
                "  --sigma M        position noise, metres (default 25)\n"
-               "  --fast           don't pace to real time\n";
+               "  --fast           don't pace to real time\n"
+               "  --key-file PATH  authenticate reports with this key (openssl rand -hex 32)\n"
+               "  --insecure       send unauthenticated reports instead\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -77,6 +83,10 @@ Options parse_args(int argc, char** argv) {
       opt.sensor.position_sigma_m = std::stod(value());
     } else if (arg == "--fast") {
       opt.fast = true;
+    } else if (arg == "--key-file") {
+      opt.key_file = value();
+    } else if (arg == "--insecure") {
+      opt.insecure = true;
     } else if (arg == "--help" || arg == "-h") {
       print_usage();
       std::exit(0);
@@ -85,6 +95,10 @@ Options parse_args(int argc, char** argv) {
       print_usage();
       std::exit(2);
     }
+  }
+  if (opt.key_file.empty() == !opt.insecure) {
+    std::cerr << "choose one: --key-file PATH to authenticate reports, or --insecure\n";
+    std::exit(2);
   }
   if (opt.rate_hz <= 0.0) {
     std::cerr << "--rate must be positive\n";
@@ -100,6 +114,19 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
+  std::optional<vigil::auth::Sealer> sealer;
+  if (!opt.insecure) {
+    auto key = vigil::auth::load_key_file(opt.key_file);
+    if (!key) {
+      std::cerr << "vigil-sim: " << key.error() << '\n';
+      return 2;
+    }
+    sealer.emplace(*key, vigil::auth::epoch_now());
+  }
+  // The envelope takes some room, so an authenticated report carries a few fewer detections.
+  const std::size_t max_detections =
+      sealer ? vigil::auth::kMaxDetections : vigil::wire::kMaxDetections;
+
   auto scenario = vigil::sim::Scenario::make_default(opt.targets, opt.sensor, opt.seed);
   vigil::UdpSocket socket;
 
@@ -109,7 +136,8 @@ int main(int argc, char** argv) {
   auto next_send = std::chrono::steady_clock::now();
 
   std::cout << "vigil-sim: " << opt.targets << " targets -> " << opt.host << ':' << opt.port
-            << " at " << opt.rate_hz << " Hz" << (opt.fast ? " (fast)" : "") << '\n';
+            << " at " << opt.rate_hz << " Hz" << (opt.fast ? " (fast)" : "")
+            << (sealer ? ", authenticated" : ", UNAUTHENTICATED") << '\n';
 
   std::uint32_t seq = 0;
   for (std::uint64_t n = 0; g_stop == 0 && (opt.scans == 0 || n < opt.scans); ++n) {
@@ -122,12 +150,13 @@ int main(int argc, char** argv) {
     report.detections = scan.detections;
     // One report must fit one unfragmented datagram (see docs/ICD.md). The detections are
     // already shuffled, so truncating drops a random subset.
-    if (report.detections.size() > vigil::wire::kMaxDetections) {
+    if (report.detections.size() > max_detections) {
       std::cerr << "scan " << report.seq << ": truncating " << report.detections.size()
-                << " detections to " << vigil::wire::kMaxDetections << '\n';
-      report.detections.resize(vigil::wire::kMaxDetections);
+                << " detections to " << max_detections << '\n';
+      report.detections.resize(max_detections);
     }
-    socket.send_to(opt.host, opt.port, vigil::encode(report));
+    const auto message = vigil::encode(report);
+    socket.send_to(opt.host, opt.port, sealer ? sealer->seal(message) : message);
 
     if (report.seq % 10 == 0) {
       std::cout << "scan " << report.seq << "  t=" << scan.time_s << "s  "

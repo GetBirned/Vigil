@@ -10,7 +10,8 @@ add_executable(vigil_tests
   test_publish.cpp
   test_spatial_grid.cpp
   test_spsc_queue.cpp
-  test_latency_histogram.cpp)
+  test_latency_histogram.cpp
+  test_auth.cpp)
 target_link_libraries(vigil_tests PRIVATE vigil::common vigil::sim vigil::tracker GTest::gtest_main
                                         vigil_options)
 
